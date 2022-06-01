@@ -79,8 +79,17 @@ let restoreFolderFromFile folder zipFile =
     if not <| Directory.Exists folder then
         zipFile |> unZipTo folder
 
-// Location of IKVM Compiler & ildasm / ilasm
-let ikvmcExe = root </> "paket-files/sergeytihon.files.wordpress.com/ikvm-8.1.5717.0/bin/ikvmc.exe"
+// Location of IKVM Compiler
+let ikvmVersion = @"8.2.0-prerelease.392"
+let ikvmRootFolder = root </> "paket-files" </> "github.com"
+
+let ikvmcFolder_NetFramework = ikvmRootFolder </> "ikvm-" + ikvmVersion + "-tools-net461-win7-x64"
+let ikvmcFolder_NetCore_Windows = ikvmRootFolder </> "ikvm-" + ikvmVersion + "-tools-net461-win7-x64"
+let ikvmcFolder_NetCore_Linux = ikvmRootFolder </> "ikvm-" + ikvmVersion + "-tools-net461-linux-x64"
+
+let ikvmcExe_NetFramework = ikvmcFolder_NetFramework </> "ikvmc.exe"
+let ikvmcExe_NetCore_Windows = ikvmcFolder_NetCore_Windows </> "ikvmc.exe"
+let ikvmcExe_NetCore_Linux = ikvmcFolder_NetCore_Linux </> "ikvmc.exe"
 
 type IKVMcTask(jar:string, version:string) =
     member __.JarFile = jar
@@ -96,11 +105,33 @@ type IKVMcTask(jar:string, version:string) =
 
 let timeOut = TimeSpan.FromSeconds(120.0)
 
-let IKVMCompile workingDirectory keyFile tasks =
+let IKVMCompile framework workingDirectory keyFile tasks =
+    let origKeyFile =
+        if (File.Exists keyFile) then
+            Path.GetFileName(keyFile)
+        else keyFile
+    let (|StartsWith|_|) needle (haystack : string) = if haystack.StartsWith(string needle) then Some() else None
+    let command =
+        (match framework with
+        | StartsWith "net4" () ->
+            (if Environment.isWindows
+            then ikvmcExe_NetFramework
+            else "mono")
+        | _ ->
+            (if Environment.isWindows
+            then ikvmcExe_NetCore_Windows
+            else ikvmcExe_NetCore_Linux))
+    let commandArgs args =
+        (match framework with
+        | StartsWith "net4" () ->
+            (if not <| Environment.isWindows
+            then ikvmcExe_NetFramework + " " + args
+            else args)
+        | _ -> args)
+         
     let ikvmc args =
-        (if Environment.isWindows
-         then CreateProcess.fromRawCommandLine ikvmcExe args
-         else CreateProcess.fromRawCommandLine "mono" (ikvmcExe + " " + args))
+        let cArgs = commandArgs args
+        CreateProcess.fromRawCommandLine command cArgs
         |> CreateProcess.withWorkingDirectory (DirectoryInfo(workingDirectory).FullName)
         |> CreateProcess.withTimeout timeOut
         |> CreateProcess.ensureExitCode
@@ -128,6 +159,8 @@ let IKVMCompile workingDirectory keyFile tasks =
             if not <| String.IsNullOrEmpty(task.Version)
                 then task.Version |> bprintf sb " -version:%s"
             bprintf sb " %s -out:%s" task.JarFile task.DllFile
+            bprintf sb " -keyfile:%s" origKeyFile
+            //bprintf sb " -debug" // Not supported on Mono
             sb.ToString()
 
         if cache.Contains task.JarFile
@@ -229,13 +262,13 @@ let keyFile = @"./nuget/OpenNLP.snk"
 // Clean build results
 
 Target.create "Clean" (fun _ ->
-     Shell.cleanDirs ["bin"; "temp"]
+     Shell.cleanDirs ["bin"; "temp"; "TestResults"]
 )
 
 // --------------------------------------------------------------------------------------
 // Compile Stanford.NLP.CoreNLP and build NuGet package
 
-let openNLPDir = root </> "paket-files/dlcdn.apache.org/apache-opennlp-1.9.4/lib"
+let openNLPDir = root </> "paket-files/archive.apache.org/apache-opennlp-1.9.1/lib"
 
 Target.create "Compile" (fun _ ->
     // Get *.jar file for compilation
@@ -246,15 +279,23 @@ Target.create "Compile" (fun _ ->
     if (jars.IsEmpty)
     then failwith "Found 0 *.jar files"
 
-    let ikvmDir  = @"bin/lib"
-    Shell.mkdir ikvmDir
-
     let dotFile = "nuget/OpenNLP.dot"
     if not <| File.Exists dotFile then
         buildJDepsGraph dotFile openNLPDir jars
 
+    let framework  = @"net461"
+    let ikvmDir  = @"bin/lib/" + framework
+    Shell.mkdir ikvmDir
+
     createCompilationGraph dotFile openNLPDir jars
-    |> IKVMCompile ikvmDir keyFile
+    |> IKVMCompile framework ikvmDir keyFile
+
+    let framework  = @"netcoreapp3.1"
+    let ikvmDir  = @"bin/lib/" + framework
+    Shell.mkdir ikvmDir
+
+    createCompilationGraph dotFile openNLPDir jars
+    |> IKVMCompile framework ikvmDir keyFile
 )
 
 Target.create "NuGet" (fun _ ->
@@ -272,16 +313,22 @@ Target.create "BuildTests" (fun _ ->
 )
 
 Target.create "RunTests" (fun _ ->
-    let libs = !! "tests/**/bin/Release/net45/*.Tests.dll"
-    let args = String.Join(" ", libs)
-    let runner = "packages/NUnit.ConsoleRunner/tools/nunit3-console.exe"
 
-    (if Environment.isWindows
-     then CreateProcess.fromRawCommandLine runner args
-     else CreateProcess.fromRawCommandLine "mono" (runner + " " + args))
-    |> CreateProcess.ensureExitCode
-    |> Proc.run
-    |> ignore
+    let doubleQuote = '"'
+
+    Trace.trace $"Running tests for netcoreapp3.1"
+    let libs = !! "tests/**/bin/Release/netcoreapp3.1/*.Tests.dll"
+    for lib in libs do
+        let result = DotNet.exec id "test" $"{lib} -c Release --no-build --logger:{doubleQuote}console;verbosity=normal{doubleQuote} --logger:{doubleQuote}trx;LogFileName={doubleQuote}netcoreapp3.1-{Path.GetFileNameWithoutExtension(lib)}-TestResults.trx{doubleQuote}"
+        if not result.OK
+        then failwithf "Tests failed: %A" result.Errors
+
+    Trace.trace $"Running tests for net461"
+    let libs = !! "tests/**/bin/Release/net461/*.Tests.dll"
+    for lib in libs do
+        let result = DotNet.exec id "test" $"{lib} -c Release --no-build --logger:{doubleQuote}console;verbosity=normal{doubleQuote} --logger:{doubleQuote}trx;LogFileName={doubleQuote}net461-{Path.GetFileNameWithoutExtension(lib)}-TestResults.trx{doubleQuote}"
+        if not result.OK
+        then failwithf "Tests failed: %A" result.Errors
 )
 
 // --------------------------------------------------------------------------------------
